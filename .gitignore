@@ -1,0 +1,15 @@
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data
+# NOTE: posted_articles.db is COMMITTED to the repo on purpose so the
+# GitHub Actions cloud bot can remember what was already posted.
+posted_articles.json
+logs/
+daemon.log
