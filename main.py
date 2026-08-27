@@ -2,9 +2,10 @@
 """
 Humshehri Facebook Auto-Poster
 ================================
-Fetches newly published articles from humshehri.pk (WordPress REST API, with
+Fetches newly published articles from humshehri.online (WordPress REST API, with
 RSS feed fallback) and posts them to a Facebook Page via the Meta Graph API
-with randomized intervals to keep the posting cadence organic.
+with randomized intervals to keep the posting cadence organic. Each post
+shares the article's full text as the photo caption with no website link.
 
 Run `python main.py --help` for CLI options.
 """
@@ -102,9 +103,9 @@ class Config:
         return cls(
             facebook_page_id=page_id,
             facebook_page_access_token=token,
-            rss_feed_url=os.getenv("RSS_FEED_URL", "https://humshehri.pk/feed/").strip(),
+            rss_feed_url=os.getenv("RSS_FEED_URL", "https://www.humshehri.online/feed/").strip(),
             wp_api_url=os.getenv(
-                "WP_API_URL", "https://humshehri.pk/wp-json/wp/v2/posts"
+                "WP_API_URL", "https://www.humshehri.online/wp-json/wp/v2/posts"
             ).strip(),
             schedule_mode=schedule_mode,
             intervals_min=intervals,
@@ -194,13 +195,21 @@ class Article:
     image_url: Optional[str]
     published_at: Optional[str] = None
 
+    FACEBOOK_MSG_LIMIT = 63206
+    # Keep a safety buffer below Facebook's hard limit (Urdu multibyte chars
+    # and newlines count differently), and keep content comfortably short.
+    MAX_CAPTION_CHARS = 60000
+
     @property
     def facebook_caption(self) -> str:
-        parts = [self.title]
-        if self.summary:
-            parts.append(self.summary)
-        parts.append(f"Read more: {self.link}")
-        return "\n\n".join(parts)
+        """Full article text (no website link) as the Facebook post body."""
+        body = self.content.strip() if self.content else self.summary.strip()
+        caption = self.title.strip()
+        if body:
+            caption = f"{caption}\n\n{body}"
+        return caption[: self.MAX_CAPTION_CHARS].rstrip() + (
+            "\n…" if len(caption) > self.MAX_CAPTION_CHARS else ""
+        )
 
 
 class Storage:
@@ -459,7 +468,7 @@ class ArticleFetcher:
     def _resolve_featured_image(self, media_id: Optional[int]) -> Optional[str]:
         if not media_id:
             return None
-        url = f"https://humshehri.pk/wp-json/wp/v2/media/{media_id}?_fields=source_url"
+        url = f"https://www.humshehri.online/wp-json/wp/v2/media/{media_id}?_fields=source_url"
         try:
             data = self._request_json(url)
             if data:
@@ -503,12 +512,11 @@ class FacebookPoster:
         self.session = requests.Session()
 
     def post(self, article: Article) -> str:
-        if self.config.post_with_image and article.image_url:
-            try:
-                return self._post_photo(article)
-            except requests.HTTPError as exc:
-                log.warning("Photo post failed (%s); falling back to a link post", exc)
-        return self._post_link(article)
+        # Only posts articles that have a featured image — articles without an
+        # image are skipped entirely (no plain-text/link post).
+        if not article.image_url:
+            raise ValueError("Article has no image; skipping (per configuration)")
+        return self._post_photo(article)
 
     def _post_photo(self, article: Article) -> str:
         url = f"{GRAPH_BASE_URL}/{self.config.facebook_page_id}/photos"
@@ -518,15 +526,6 @@ class FacebookPoster:
             "access_token": self.config.facebook_page_access_token,
         }
         return self._graph_request(url, params, "photo")
-
-    def _post_link(self, article: Article) -> str:
-        url = f"{GRAPH_BASE_URL}/{self.config.facebook_page_id}/feed"
-        params = {
-            "message": article.facebook_caption,
-            "link": article.link,
-            "access_token": self.config.facebook_page_access_token,
-        }
-        return self._graph_request(url, params, "feed")
 
     def _graph_request(self, url: str, params: Dict[str, str], kind: str) -> str:
         last_error: Optional[Exception] = None
@@ -603,6 +602,16 @@ class Scheduler:
                 break
             log.info("Posting article [%s]: %s", article.guid, article.title)
             try:
+                if not article.image_url:
+                    log.info(
+                        "  SKIPPED [%s]: article has no image (only image articles are posted)",
+                        article.guid,
+                    )
+                    self.storage.mark_posted(article.guid, article.title, article.link)
+                    posted_count += 1
+                    if self.cron_mode:
+                        self._set_cadence_gate()
+                    continue
                 if dry_run:
                     log.info("  [DRY RUN] would post: %s", article.facebook_caption.replace("\n", " | "))
                 else:
@@ -698,7 +707,7 @@ class Scheduler:
 
 def build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Auto-post humshehri.pk articles to a Facebook Page."
+        description="Auto-post humshehri.online articles to a Facebook Page."
     )
     parser.add_argument("--once", action="store_true",
                         help="Fetch and post all new articles once, then exit.")

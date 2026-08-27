@@ -1,32 +1,40 @@
 # Humshehri Facebook Auto-Poster
 
 A production-ready Python bot that automatically fetches newly published
-articles from **[humshehri.pk](https://humshehri.pk/)** and publishes them to
-the **Humshehri Facebook Page** with **randomized, human-feeling intervals** so
-your page never looks spammy.
+articles from **[humshehri.online](https://www.humshehri.online/)** and posts
+them to the **Humshehri Facebook Page** with **randomized, human-feeling
+intervals** so your page never looks spammy. Each post shares the **full
+article text** (title + entire body) as the photo caption with **no website
+link** — the complete article is shared on the page, not a link back to the
+site.
 
 The bot parses the site's RSS feed **and** its WordPress REST API (auto-falls
-back when the feed is empty or blocked), extracts title, summary, featured
-image and the article link, and posts each article to Facebook via the **Meta
-Graph API** with a photo attached.
+back when the feed is empty or blocked) to extract the title, the full body,
+the featured image, and the article link (used only internally). It posts each
+article to Facebook via the **Meta Graph API** with the featured image
+attached and the full text as the caption.
 
 ---
 
 ## Features
 
 - **Two article sources** — WordPress REST API first, RSS feed as fallback
-  (the `/feed/` endpoint on humshehri.pk is WAF-protected, so the bot uses the
-  reliable `wp-json/wp/v2/posts` API automatically).
+  (the `/feed/` endpoint on humshehri.online is WAF-protected, so the bot uses
+  the reliable `wp-json/wp/v2/posts` API automatically).
 - **Image extraction** — resolves each article's featured image through the
   WordPress media API.
+- **Full-text posting** — each post carries the article's **complete text**
+  (title + entire body) as the photo caption, with **no website link**.
+- **Image-only posting** — articles that have **no featured image are skipped**
+  entirely (no text/link-only posts).
 - **Duplicate prevention** — posted article IDs/GUIDs are stored in SQLite
   (or JSON); nothing is ever re-posted, even across restarts.
 - **Randomized scheduling** — pick a random delay from a preset list
   (`3, 5, 7, 11, 13, 17, 21, 27` minutes) **or** a random integer between 3 and
   30 minutes.
 - **Robust error handling** — automatic retries with exponential backoff,
-  photo-post failure falls back to a link post, permanently broken articles
-  are skipped after a configurable number of attempts.
+  photo-post failures are retried, permanently broken articles are skipped
+  after a configurable number of attempts.
 - **Clear logging** — console + rotating file logs showing fetched articles,
   time remaining until the next post, and successful Facebook post IDs.
 - **Safe to test** — `--dry-run` and `--list-new` modes that never touch
@@ -208,8 +216,9 @@ python main.py
 
 The bot now runs forever:
 
-1. Fetches new articles from humshehri.pk.
-2. Posts each one to the page (photo post, or link post if no image).
+1. Fetches new articles from humshehri.online.
+2. Posts each one to the page (full article text as the photo caption; no
+   website link). Articles without a featured image are skipped.
 3. Waits a **random** interval before the next post (default preset:
    3–27 minutes, or random 3–30 minutes in `random` mode).
 4. When no new articles exist, it re-checks every `POLL_INTERVAL_MIN`
@@ -369,7 +378,7 @@ pip install supervisor
 | `HTTP 406` from the feed | Expected — the RSS feed is WAF-blocked. The bot automatically falls back to the WordPress REST API. |
 | `Graph API error 190 (expired token)` | Token expired. Re-generate a Page token as in the guide; check it has no `expires_at`. |
 | `Graph API error 200 (permission)` | Missing `pages_manage_posts` scope, or the token is a User token, not a Page token. |
-| `(#100) Invalid image url` | The featured image could not be fetched; the bot already falls back to a text+link post. |
+| `(#100) Invalid image url` | The featured image could not be fetched; the article is skipped (image-only posting is enabled). |
 | Article not appearing on the page | The bot may be mid-interval. Wait for the next randomized post time or check the log file. |
 | Duplicate posts | Should not happen — the SQLite `posted_articles` table prevents it. Keep `posted_articles.db` in the project folder. |
 
@@ -381,15 +390,15 @@ pip install supervisor
 |---|---|---|
 | `FACEBOOK_PAGE_ID` | `100071825280252` | Numeric Page ID. |
 | `FACEBOOK_PAGE_ACCESS_TOKEN` | *(empty)* | Non-expiring Page access token. |
-| `RSS_FEED_URL` | `https://humshehri.pk/feed/` | RSS source (fallback). |
-| `WP_API_URL` | `https://humshehri.pk/wp-json/wp/v2/posts` | WordPress REST API source. |
+| `RSS_FEED_URL` | `https://www.humshehri.online/feed/` | RSS source (fallback). |
+| `WP_API_URL` | `https://www.humshehri.online/wp-json/wp/v2/posts` | WordPress REST API source. |
 | `SCHEDULE_MODE` | `preset` | `preset` or `random`. |
 | `INTERVALS_MIN` | `3,5,7,11,13,17,21,27` | Preset delays in minutes. |
 | `MIN_INTERVAL_MIN` / `MAX_INTERVAL_MIN` | `3` / `30` | Random delay bounds. |
 | `POLL_INTERVAL_MIN` | `30` | Re-check delay when no new articles. |
 | `STORAGE` | `sqlite` | `sqlite` or `json`. |
 | `DB_PATH` | `posted_articles.db` | Database file path. |
-| `POST_WITH_IMAGE` | `true` | Attach featured image when available. |
+| `POST_WITH_IMAGE` | `true` | Image-only posting — articles without a featured image are skipped. Full text is posted as the caption, no link. |
 | `HTTP_TIMEOUT` / `MAX_RETRIES` | `20` / `3` | Network tuning. |
 | `MAX_POST_ATTEMPTS` | `3` | Attempts before skipping a broken article. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
