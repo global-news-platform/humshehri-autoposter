@@ -188,6 +188,28 @@ def strip_html(raw: str, max_chars: Optional[int] = None) -> str:
 
 _IMAGE_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 
+_HOST_RE = re.compile(r'^(https?://)([^/]+)(/.*)?$', re.IGNORECASE)
+
+
+def _alternate_host_url(url: str) -> Optional[str]:
+    """Return a variant of url switching between `www.` and the bare host.
+
+    The WordPress site is served from both `www.humshehry.online` and
+    `humshehry.online`, and occasionally one host is unreachable from a given
+    network while the other works. Trying both makes fetching robust.
+    """
+    m = _HOST_RE.match(url)
+    if not m:
+        return None
+    scheme, host, path = m.group(1), m.group(2), m.group(3) or ""
+    if host.lower().startswith("www."):
+        new_host = host[4:]
+    else:
+        new_host = "www." + host
+    if new_host.lower() == host.lower():
+        return None
+    return f"{scheme}{new_host}{path}"
+
 
 def _first_image_url(raw: str) -> Optional[str]:
     """Return the first <img> URL in an HTML string, if any."""
@@ -424,16 +446,24 @@ class ArticleFetcher:
     def _fetch_via_rss(self, limit: int) -> List[Article]:
         if feedparser is None:
             return []
-        try:
-            feed = feedparser.parse(self.config.rss_feed_url)
-        except Exception as exc:  # pragma: no cover
-            log.warning("RSS feed parsing failed (%s); falling back to WP REST API", exc)
-            return []
-        entries = getattr(feed, "entries", [])[:limit]
-        if not entries:
-            log.info("RSS feed returned no entries; falling back to WP REST API")
-            return []
-        log.info("Fetched %d article(s) from RSS feed", len(entries))
+        feed_urls = [self.config.rss_feed_url]
+        alt = _alternate_host_url(self.config.rss_feed_url)
+        if alt and alt != self.config.rss_feed_url:
+            feed_urls.append(alt)
+        for feed_url in feed_urls:
+            try:
+                feed = feedparser.parse(feed_url)
+            except Exception as exc:  # pragma: no cover
+                log.warning("RSS feed parsing failed (%s)", exc)
+                continue
+            entries = getattr(feed, "entries", [])[:limit]
+            if entries:
+                log.info("Fetched %d article(s) from RSS feed (%s)", len(entries), feed_url)
+                return self._build_from_rss(entries)
+            log.info("RSS feed returned no entries (%s)", feed_url)
+        return []
+
+    def _build_from_rss(self, entries) -> List[Article]:
         articles: List[Article] = []
         for entry in entries:
             guid = entry.get("id") or entry.get("link") or ""
@@ -495,7 +525,11 @@ class ArticleFetcher:
     def _resolve_featured_image(self, media_id: Optional[int]) -> Optional[str]:
         if not media_id:
             return None
-        url = f"https://www.humshehri.online/wp-json/wp/v2/media/{media_id}?_fields=source_url"
+        base = self.config.wp_api_url.rstrip("/")
+        base = base.split("?")[0]
+        if base.endswith("/posts"):
+            base = base[: -len("/posts")]
+        url = f"{base}/media/{media_id}?_fields=source_url"
         try:
             data = self._request_json(url)
             if data:
@@ -505,26 +539,36 @@ class ArticleFetcher:
         return None
 
     def _request_json(self, url: str) -> Optional[dict]:
+        candidate_urls = [url]
+        alt = _alternate_host_url(url)
+        if alt and alt != url:
+            candidate_urls.append(alt)
         last_error: Optional[Exception] = None
-        for attempt in range(1, self.config.max_retries + 1):
-            try:
-                resp = self.session.get(url, timeout=self.config.http_timeout)
-                if resp.status_code == 406:
-                    raise requests.HTTPError(
-                        f"HTTP 406 (WAF blocked); will retry with a fresh request (attempt {attempt})"
-                    )
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as exc:
-                last_error = exc
-                if attempt < self.config.max_retries:
-                    backoff = 2 ** attempt
-                    log.warning(
-                        "Request failed (%s); retrying in %ds (attempt %d/%d)",
-                        exc, backoff, attempt, self.config.max_retries,
-                    )
-                    time.sleep(backoff)
-        log.error("Request to %s failed after %d attempts: %s", url, self.config.max_retries, last_error)
+        for current_url in candidate_urls:
+            for attempt in range(1, self.config.max_retries + 1):
+                try:
+                    resp = self.session.get(current_url, timeout=self.config.http_timeout)
+                    if resp.status_code == 406:
+                        raise requests.HTTPError(
+                            f"HTTP 406 (WAF blocked); will retry with a fresh request (attempt {attempt})"
+                        )
+                    resp.raise_for_status()
+                    return resp.json()
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < self.config.max_retries:
+                        backoff = 2 ** attempt
+                        log.warning(
+                            "Request to %s failed (%s); retrying in %ds (attempt %d/%d)",
+                            current_url, exc, backoff, attempt, self.config.max_retries,
+                        )
+                        time.sleep(backoff)
+            if len(candidate_urls) > 1:
+                log.warning(
+                    "All attempts to %s failed (%s); trying alternate host %s",
+                    current_url, last_error, _alternate_host_url(current_url),
+                )
+        log.error("Request to %s failed after all attempts: %s", url, last_error)
         return None
 
     def close(self) -> None:
