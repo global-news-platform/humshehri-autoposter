@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import sqlite3
 import sys
@@ -39,7 +40,7 @@ except ImportError:  # pragma: no cover
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-GRAPH_API_VERSION = "v20.0"
+GRAPH_API_VERSION = "v25.0"
 GRAPH_BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 BROWSER_HEADERS = {
@@ -183,6 +184,20 @@ def strip_html(raw: str, max_chars: Optional[int] = None) -> str:
     if max_chars and len(text) > max_chars:
         text = text[: max_chars - 1].rstrip() + "…"
     return text
+
+
+_IMAGE_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _first_image_url(raw: str) -> Optional[str]:
+    """Return the first <img> URL in an HTML string, if any."""
+    if not raw:
+        return None
+    match = _IMAGE_SRC_RE.search(raw)
+    if match:
+        src = html.unescape(match.group(1)).strip()
+        return src or None
+    return None
 
 
 @dataclass
@@ -379,8 +394,8 @@ class _JsonStorage:
 
 
 class ArticleFetcher:
-    """Fetches new articles, trying the RSS feed first and falling back to the
-    WordPress REST API (more reliable on this site) when the feed is empty."""
+    """Fetches new articles, preferring the WordPress REST API (which reliably
+    exposes each post's featured image) and falling back to the RSS feed."""
 
     def __init__(self, config: Config, storage: Storage):
         self.config = config
@@ -389,9 +404,11 @@ class ArticleFetcher:
         self.session.headers.update(BROWSER_HEADERS)
 
     def fetch_new_articles(self, limit: int = 10) -> List[Article]:
-        candidates = self._fetch_via_rss(limit)
+        # WP REST API is preferred: it reliably exposes each post's featured
+        # image (which the poster requires). RSS is kept only as a fallback.
+        candidates = self._fetch_via_wp_api(limit)
         if not candidates:
-            candidates = self._fetch_via_wp_api(limit)
+            candidates = self._fetch_via_rss(limit)
         if not candidates:
             log.info("No articles returned by any source")
             return []
@@ -423,14 +440,24 @@ class ArticleFetcher:
             if not guid:
                 continue
             summary = strip_html(entry.get("summary", ""), max_chars=400)
+            raw_content = entry.get("content", [{}])
+            if isinstance(raw_content, list):
+                raw_content = raw_content[0].get("value", "") if raw_content else ""
+            else:
+                raw_content = raw_content.get("value", "") if isinstance(raw_content, dict) else str(raw_content)
             media = entry.get("media_content") or entry.get("media_thumbnail") or []
             image_url = media[0].get("url") if media else None
+            if not image_url:
+                # Some WordPress feeds carry the featured image only inside the
+                # post content's HTML (no <media:content>/<enclosure>), so grab
+                # the first <img> from the content/description as a fallback.
+                image_url = _first_image_url(raw_content or entry.get("summary", ""))
             articles.append(
                 Article(
                     guid=guid,
                     title=strip_html(entry.get("title", "")),
                     summary=summary,
-                    content=strip_html(entry.get("summary", ""), max_chars=5000),
+                    content=strip_html(raw_content or entry.get("summary", ""), max_chars=5000),
                     link=entry.get("link", ""),
                     image_url=image_url,
                     published_at=entry.get("published", entry.get("updated")),
