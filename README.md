@@ -1,32 +1,80 @@
 # Humshehri Facebook Auto-Poster
 
 A production-ready Python bot that automatically fetches newly published
-articles from **[humshehri.online](https://www.humshehri.online/)** and posts
+articles from **[humshehri.online](https://humshehri.online/)** and posts
 them to the **Humshehri Facebook Page** with **randomized, human-feeling
-intervals** so your page never looks spammy. Each post shares the **full
-article text** (title + entire body) as the photo caption with **no website
-link** — the complete article is shared on the page, not a link back to the
-site.
+intervals** so your page never looks spammy. Each post is an **exact copy** of
+a published article: the **original title** and the **complete original body**
+(Urdu/English text, punctuation, numbers, links and paragraph breaks preserved
+verbatim) attached as the caption to the article's **own image** — with **no AI
+rewriting**, **no truncation** and **no logo
+fallback**. The full article is shared on the page, not a link back to the
+site. When hashtags are enabled they are appended **after** the article text
+as a separate layer — they never alter the exact copy.
 
-The bot parses the site's RSS feed **and** its WordPress REST API (auto-falls
-back when the feed is empty or blocked) to extract the title, the full body,
-the featured image, and the article link (used only internally). It posts each
-article to Facebook via the **Meta Graph API** with the featured image
-attached and the full text as the caption.
+The bot parses the site's RSS feed **and** its WordPress REST API (the API runs
+alongside the feed, so articles the feed misses or mis-numbers are still found)
+to discover articles, then opens each article's **full page** to copy the exact
+title, body and featured image. It posts each article to Facebook via the
+**Meta Graph API** with the article's own image attached and the full text as
+the caption, from one authoritative source.
 
 ---
 
 ## Features
 
-- **Two article sources** — WordPress REST API first, RSS feed as fallback
-  (the `/feed/` endpoint on humshehri.online is WAF-protected, so the bot uses
-  the reliable `wp-json/wp/v2/posts` API automatically).
-- **Image extraction** — resolves each article's featured image through the
-  WordPress media API.
-- **Full-text posting** — each post carries the article's **complete text**
-  (title + entire body) as the photo caption, with **no website link**.
-- **Image-only posting** — articles that have **no featured image are skipped**
-  entirely (no text/link-only posts).
+- **Two discovery sources, merged** — the RSS feed **and** the WordPress REST
+  API are both fetched on every run (the pretty `/feed/` and `/wp-json/` paths
+  on humshehri.online are 404-protected by its server, so the bot fetches the
+  query-parameter equivalents `?feed=rss2` and `?rest_route=/wp/v2/posts`
+  instead, and its guids are sometimes stale/mis-numbered, so the
+  bot never trusts the feed alone). Candidates are merged by post id / URL; the
+  **real post id, canonical URL and title are resolved from the article page
+  itself** after redirects, so a mis-numbered feed entry can never publish the
+  wrong headline. The same article arriving from both sources is processed
+  once.
+- **Exact content-fingerprint dedupe** — every candidate's content is reduced to
+  a SHA-256 fingerprint of its normalized title + body (whitespace/case only,
+  never fuzzy). WordPress "-2" duplicate copies of the same story are detected
+  purely by that fingerprint, so the same article is never reposted under a
+  different post id.
+- **Exact-copy extraction from the full article page** — the article's own page
+  is the authoritative source. The bot opens it, finds the article container
+  (`.entry-content` etc., excluding navigation, menus, sidebars, ad blocks and
+  the site header/footer) and copies the **original title + full body
+  verbatim**: paragraphs, heading levels, lists, Urdu + English text, numbers,
+  punctuation and article URLs are all preserved. Nothing is rewritten,
+  summarized or truncated. Hashtags, when enabled, are appended only after the
+article text — never inserted between paragraphs.
+- **Robust image extraction** — resolves each article's featured image with a
+  fallback chain: RSS/media → `og:image` → JSON-LD → `twitter:image` → article
+  `<img>`. If the feed has no image, the bot opens the article page itself to
+  find the real photo (logos/pixels/ads are filtered out). The image and the
+  text always come from the **same article**.
+- **Native photo posts, no link previews** — the bot **downloads the image
+  file** and uploads the actual bytes to Facebook's `/photos` endpoint
+  (multipart `source`). Facebook never fetches the website, so there is no
+  `Invalid image url` failure, no link preview and no auto-added link. WebP
+  images are re-encoded to JPEG in memory if Pillow is installed.
+- **No rewriting, no truncation** — the caption is exactly `title + "\n\n" +
+  body`. URLs inside the article text are preserved; only the website's own
+  navigation/chrome is excluded. There is no 5000-character cap; as a safety
+  measure an article whose full text would exceed Facebook's hard limit
+  (~63,206 characters) is skipped rather than silently cut off.
+- **Relevant hashtags appended, exact copy preserved** — `ADD_HASHTAGS=true`
+  (the default) appends a 3-7 hashtag mix of broad category and specific topic
+  tags (Urdu + English, keyword-matched to the article) **after the original
+  text**, on their own line. Hashtags are sanitized (no spaces/URLs/duplicates
+  or stray prose), deduplicated case-insensitively, and dropped one at a time
+  if the combined caption nears Facebook's character limit — the article text
+  is never truncated, and if the article alone exceeds the platform limit the
+  post fails safely. Cap the block with `MAX_HASHTAGS`.
+- **Own image required, never a logo fallback** — every post uses the article's
+  **own image**. By default (`REQUIRE_ARTICLE_IMAGE=true`) an article whose
+  image cannot be found or downloaded is safety-skipped — it is **never** posted
+  image-less and the brand logo is **never** used as a substitute. Set
+  `REQUIRE_ARTICLE_IMAGE=false` if you'd rather such articles go out as
+  text-only posts.
 - **Duplicate prevention** — posted article IDs/GUIDs are stored in SQLite
   (or JSON); nothing is ever re-posted, even across restarts.
 - **Randomized scheduling** — pick a random delay from a preset list
@@ -202,6 +250,28 @@ Facebook.
 python main.py --once --dry-run
 ```
 
+`--dry-run` also downloads each article's image (without posting) and prints a
+per-article diagnostic block showing the canonical URL, source, extraction
+method, title, text/paragraph counts, chosen image and the exact caption
+(start and end), so you can confirm the copy is exact before it ever goes
+live.
+
+### Test extraction on a real article (no Facebook call, no posting)
+
+```bash
+python main.py --test-extraction https://www.humshehri.online/?p=1327
+```
+
+Reports the canonical URL, page title, body length/paragraph count, the first
+12 lines and every image candidate found for the URL — RSS/media if present,
+then `og:image`, `twitter:image`, JSON-LD and the article's `<img>` — and
+test-downloads each one. Pass several URLs to check multiple articles.
+`python tests/test_extraction.py`, `python tests/test_image_pipeline.py` and
+`python tests/test_hashtags.py` run offline suites covering exact-copy text
+extraction, image priority, no-logo-fallback, hashtag generation/sanitization
+and hashtag appending after the exact article
+behavior.
+
 ### Post everything currently un-posted once, then exit
 
 ```bash
@@ -217,8 +287,10 @@ python main.py
 The bot now runs forever:
 
 1. Fetches new articles from humshehri.online.
-2. Posts each one to the page (full article text as the photo caption; no
-   website link). Articles without a featured image are skipped.
+2. Posts each one as a native photo with the article's **exact copy** as the
+   caption (original title + full body, no website link, no rewriting, no URL
+   scrubbing), using the article's **own image** — never a logo fallback (see
+   `REQUIRE_ARTICLE_IMAGE`).
 3. Waits a **random** interval before the next post (default preset:
    3–27 minutes, or random 3–30 minutes in `random` mode).
 4. When no new articles exist, it re-checks every `POLL_INTERVAL_MIN`
@@ -378,9 +450,11 @@ pip install supervisor
 | `HTTP 406` from the feed | Expected — the RSS feed is WAF-blocked. The bot automatically falls back to the WordPress REST API. |
 | `Graph API error 190 (expired token)` | Token expired. Re-generate a Page token as in the guide; check it has no `expires_at`. |
 | `Graph API error 200 (permission)` | Missing `pages_manage_posts` scope, or the token is a User token, not a Page token. |
-| `(#100) Invalid image url` | The featured image could not be fetched; the article is skipped (image-only posting is enabled). |
+| `(#100) Invalid image url` | Older versions passed an image *URL* to Facebook. Today the bot downloads the image itself and uploads the file, so this is no longer produced. If a download fails, the bot logs the reason and moves to the next image candidate. |
+| Article skipped but it has an image on the site | Strict mode (`PREFER_FULL_ARTICLE_PAGE`/`STRICT_ARTICLE_EXTRACTION`/`REQUIRE_ARTICLE_IMAGE`) skips any article whose full page text or own image can't be verified, rather than posting wrong/partial content. Check the log for the exact extraction/validation reason. |
 | Article not appearing on the page | The bot may be mid-interval. Wait for the next randomized post time or check the log file. |
 | Duplicate posts | Should not happen — the SQLite `posted_articles` table prevents it. Keep `posted_articles.db` in the project folder. |
+| Caption too long for Facebook | The full text of any article larger than Facebook's ~63,206-character message limit is skipped whole (never truncated). |
 
 ---
 
@@ -390,15 +464,24 @@ pip install supervisor
 |---|---|---|
 | `FACEBOOK_PAGE_ID` | `100071825280252` | Numeric Page ID. |
 | `FACEBOOK_PAGE_ACCESS_TOKEN` | *(empty)* | Non-expiring Page access token. |
-| `RSS_FEED_URL` | `https://www.humshehri.online/feed/` | RSS source (fallback). |
-| `WP_API_URL` | `https://www.humshehri.online/wp-json/wp/v2/posts` | WordPress REST API source. |
+| `RSS_FEED_URL` | `https://humshehri.online/?feed=rss2` | RSS discovery source. |
+| `WP_API_URL` | `https://humshehri.online/?rest_route=/wp/v2/posts` | WordPress REST API discovery source (runs alongside RSS). |
+| `ENABLE_WP_API_DISCOVERY` | `true` | Fetch candidates from the WP API too (not just as an RSS fallback). |
+| `WP_API_LOOKBACK` | `20` | API `per_page` lookback for supplementary discovery. |
 | `SCHEDULE_MODE` | `preset` | `preset` or `random`. |
 | `INTERVALS_MIN` | `3,5,7,11,13,17,21,27` | Preset delays in minutes. |
 | `MIN_INTERVAL_MIN` / `MAX_INTERVAL_MIN` | `3` / `30` | Random delay bounds. |
 | `POLL_INTERVAL_MIN` | `30` | Re-check delay when no new articles. |
 | `STORAGE` | `sqlite` | `sqlite` or `json`. |
 | `DB_PATH` | `posted_articles.db` | Database file path. |
-| `POST_WITH_IMAGE` | `true` | Image-only posting — articles without a featured image are skipped. Full text is posted as the caption, no link. |
+| `POST_WITH_IMAGE` | `true` | Post each article as a native photo (image + exact full-text caption). No website link, no link preview. |
+| `REQUIRE_ARTICLE_IMAGE` | `true` | Publish only when the article's own image is usable; otherwise safety-skip (`false` → post text-only if the image is missing). |
+| `USE_AI_REWRITING` | `false` | Enforced behavior — article text is never rewritten. Kept for clarity/forward-compat. |
+| `PREFER_FULL_ARTICLE_PAGE` | `true` | Copy text straight from the article's full page; `false` uses the RSS/API excerpt. |
+| `STRICT_ARTICLE_EXTRACTION` | `true` | Fail-safe: skip when the page can't be fetched or the text is too short (navigation-like) instead of posting wrong/empty text. |
+| `MIN_ARTICLE_CHARS` | `120` | Minimum body length (chars) required in strict mode. |
+| `ADD_HASHTAGS` | `true` | Append keyword-relevant (Urdu + English) hashtags **after** the exact article text on their own line. The article itself is never modified. |
+| `MAX_HASHTAGS` | `7` | Maximum hashtags per post when enabled (3-7 performs best; excess is trimmed, not the article). |
 | `HTTP_TIMEOUT` / `MAX_RETRIES` | `20` / `3` | Network tuning. |
 | `MAX_POST_ATTEMPTS` | `3` | Attempts before skipping a broken article. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
